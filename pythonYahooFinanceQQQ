@@ -1,0 +1,196 @@
+"""Monitor educativo QQQ/USD y estimacion QQQ/MXN; no es cotizacion SIC.
+Instalar: python -m pip install yfinance pandas matplotlib tzdata
+Ejecutar: python qqq_monitor.py
+Pruebas sin red: python qqq_monitor.py --self-test
+Exportar: python qqq_monitor.py --output resultados --no-show
+"""
+from __future__ import annotations
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+import unittest
+import pandas as pd
+
+
+def extract_close(raw: pd.DataFrame, ticker: str) -> pd.Series:
+    """Normaliza columnas simples o MultiIndex (un ticker por descarga)."""
+    if raw is None or raw.empty:
+        raise ValueError(f'{ticker}: descarga vacia')
+    if isinstance(raw.columns, pd.MultiIndex):
+        candidates = [c for c in raw.columns if 'Close' in c and ticker in c]
+        if len(candidates) != 1:
+            raise ValueError(f'{ticker}: columnas Close ambiguas: {raw.columns.tolist()}')
+        close = raw[candidates[0]]
+    else:
+        if 'Close' not in raw.columns:
+            raise ValueError(f'{ticker}: falta Close: {raw.columns.tolist()}')
+        close = raw['Close']
+    close = pd.to_numeric(close, errors='coerce').dropna().copy()
+    index = pd.DatetimeIndex(close.index)
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    close.index = index.normalize()
+    close = close.sort_index()
+    if close.index.has_duplicates or close.empty or (close <= 0).any():
+        raise ValueError(f'{ticker}: fechas duplicadas o precios invalidos')
+    return close.rename(ticker)
+
+
+def download_close(ticker: str, start: str, end: str) -> pd.Series:
+    import yfinance as yf  # las pruebas no requieren yfinance ni acceso a Yahoo
+    raw = yf.download(ticker, start=start, end=end, interval='1d',
+                      auto_adjust=False, progress=False, timeout=20)
+    return extract_close(raw, ticker)
+
+
+def build_weekly(qqq: pd.Series, fx: pd.Series, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """Solo fechas comunes; no rellena huecos. Excluye semana en curso.
+    cutoff: medianoche de hoy; viernes actual tambien queda excluido.
+    Cada semana debe tener un par valido jueves o viernes para evitar
+    aceptar silenciosamente un cierre demasiado antiguo.
+    """
+    daily = pd.concat([qqq.rename('QQQ_USD'), fx.rename('USDMXN')], axis=1)
+    daily = daily.dropna().sort_index()
+    if daily.empty:
+        raise ValueError('No hay fechas comunes entre QQQ y USD/MXN')
+    daily['QQQ_MXN_EST'] = daily['QQQ_USD'] * daily['USDMXN']
+    daily['source_date'] = daily.index
+    weekly = daily.resample('W-FRI', label='right', closed='right').last()
+    weekly = weekly.loc[weekly.index < cutoff.normalize()].copy()
+    # Una semana completamente ausente o con ultimo par anterior al jueves
+    # requiere revisar datos; no calculamos indicadores saltando esos huecos.
+    stale = (weekly.index.to_series() - weekly['source_date']).dt.days > 1
+    if weekly.empty or weekly.isna().any().any() or stale.any():
+        raise ValueError('Semanas sin datos recientes; revisar descargas/calendarios')
+    return weekly
+
+
+def bullish_cross(line: pd.Series, signal: pd.Series) -> pd.Series:
+    difference = line - signal
+    return (difference > 0) & (difference.shift(1) <= 0)
+
+
+def add_indicators(weekly: pd.DataFrame) -> pd.DataFrame:
+    df = weekly.copy()
+    price = df['QQQ_MXN_EST']
+    df['SMA20'] = price.rolling(20, min_periods=20).mean()
+    df['SMA50'] = price.rolling(50, min_periods=50).mean()
+    fast = price.ewm(span=12, adjust=False, min_periods=12).mean()
+    slow = price.ewm(span=26, adjust=False, min_periods=26).mean()
+    df['MACD'] = fast - slow
+    df['SIGNAL'] = df['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
+    df['HIST'] = df['MACD'] - df['SIGNAL']
+    df['BULL_CROSS'] = bullish_cross(df['MACD'], df['SIGNAL'])
+    # Excluye el cierre actual: referencias conocidas antes de esta semana.
+    df['MIN12_PREV'] = price.shift(1).rolling(12).min()
+    df['MAX12_PREV'] = price.shift(1).rolling(12).max()
+    df['R_USD'] = df['QQQ_USD'].pct_change(fill_method=None)
+    df['R_FX'] = df['USDMXN'].pct_change(fill_method=None)
+    df['R_MXN'] = price.pct_change(fill_method=None)
+    df['INTERACTION'] = df['R_USD'] * df['R_FX']
+    return df
+
+
+def plot_monitor(df: pd.DataFrame):
+    import matplotlib.pyplot as plt
+    fig, (price_ax, macd_ax, perf_ax) = plt.subplots(3, 1, figsize=(13, 11), sharex=True)
+    df[['QQQ_MXN_EST', 'SMA20', 'SMA50']].plot(ax=price_ax)
+    last = df.iloc[-1]
+    for column in ('MIN12_PREV', 'MAX12_PREV'):
+        price_ax.axhline(last[column], linestyle=':', label=column)
+    crosses = df.loc[df['BULL_CROSS']]
+    if not crosses.empty:
+        row = crosses.iloc[-1]
+        price_ax.scatter([crosses.index[-1]], [row['QQQ_MXN_EST']], marker='^',
+                         color='purple', s=100, label='Ultimo cruce MACD alcista')
+    price_ax.set(title='QQQ en MXN estimado: semanas cerradas', ylabel='MXN por titulo')
+    price_ax.legend()
+    df[['MACD', 'SIGNAL']].plot(ax=macd_ax)
+    macd_ax.bar(df.index, df['HIST'], width=4, alpha=.35, label='Histograma')
+    macd_ax.axhline(0, color='gray', linewidth=.8)
+    macd_ax.set_ylabel('MACD (MXN)')
+    macd_ax.legend()
+    prices = df[['QQQ_USD', 'USDMXN', 'QQQ_MXN_EST']]
+    (100 * prices / prices.iloc[0]).plot(ax=perf_ax)
+    perf_ax.set(ylabel='Base 100', xlabel='Semana terminada en viernes')
+    for ax in (price_ax, macd_ax, perf_ax):
+        ax.grid(alpha=.25)
+    fig.tight_layout()
+    return fig
+
+
+class MonitorTests(unittest.TestCase):
+    def test_columns(self):
+        dates = pd.date_range('2024-01-01', periods=2)
+        for columns in ([('Close', 'QQQ')], [('QQQ', 'Close')]):
+            raw = pd.DataFrame([100, 110], index=dates,
+                               columns=pd.MultiIndex.from_tuples(columns))
+            self.assertEqual(extract_close(raw, 'QQQ').tolist(), [100, 110])
+        simple = pd.DataFrame({'Close': [100, 110]}, index=dates)
+        self.assertEqual(extract_close(simple, 'QQQ').tolist(), [100, 110])
+
+    def test_cross_date_and_nan(self):
+        line = pd.Series([float('nan'), -1, 1, 2, -1, 0, 1])
+        signal = pd.Series([0.] * 7)
+        self.assertEqual(bullish_cross(line, signal).tolist(),
+                         [False, False, True, False, False, False, True])
+
+    def test_alignment_partial_week_and_returns(self):
+        dates = pd.to_datetime(['2024-01-04', '2024-01-05', '2024-01-12', '2024-01-16'])
+        qqq = pd.Series([99., 100., 110., 999.], index=dates)
+        fx = pd.Series([20., 20., 18., 20.], index=dates)
+        df = add_indicators(build_weekly(qqq, fx, pd.Timestamp('2024-01-17')))
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(df.iloc[-1]['R_MXN'], -.01)
+        row = df.iloc[-1]
+        self.assertAlmostEqual(row['R_MXN'], row['R_USD'] + row['R_FX'] + row['INTERACTION'])
+        # Falta FX el viernes: utiliza el par comun del jueves, no mezcla fechas.
+        aligned = build_weekly(qqq, fx.drop(pd.Timestamp('2024-01-05')), pd.Timestamp('2024-01-17'))
+        self.assertEqual(aligned.iloc[0]['QQQ_MXN_EST'], 99 * 20)
+
+    def test_empty_download(self):
+        with self.assertRaises(ValueError):
+            extract_close(pd.DataFrame(), 'QQQ')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--years', type=int, default=4)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--no-show', action='store_true')
+    parser.add_argument('--self-test', action='store_true')
+    args = parser.parse_args()
+    if args.self_test:
+        result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(MonitorTests))
+        raise SystemExit(0 if result.wasSuccessful() else 1)
+    if args.years < 2:
+        parser.error('--years debe ser al menos 2 para SMA50 y calentamiento')
+    # Yahoo end es exclusivo: hoy se omite deliberadamente.
+    today = datetime.now(ZoneInfo('America/Mexico_City')).date()
+    start = (today - timedelta(days=365 * args.years)).isoformat()
+    try:
+        qqq = download_close('QQQ', start, today.isoformat())
+        fx = download_close('USDMXN=X', start, today.isoformat())
+        df = add_indicators(build_weekly(qqq, fx, pd.Timestamp(today)))
+        if len(df) < 60:
+            raise ValueError('Historial insuficiente: se requieren al menos 60 semanas')
+        last = df.iloc[-1]
+        print(f"Semana: {df.index[-1].date()} | ultima fecha comun: {last['source_date'].date()}")
+        print(f"QQQ USD: {last['QQQ_USD']:.2f} | USD/MXN: {last['USDMXN']:.4f} | MXN estimado: {last['QQQ_MXN_EST']:.2f}")
+        print(f"Retorno semanal USD: {last['R_USD']:.2%} | FX: {last['R_FX']:.2%} | MXN: {last['R_MXN']:.2%}")
+        print('Estimacion por cierres diarios de Yahoo; no es precio ejecutable SIC ni retorno total con dividendos.')
+        fig = plot_monitor(df)
+        if args.output:
+            args.output.mkdir(parents=True, exist_ok=True)
+            df.to_csv(args.output / 'qqq_weekly.csv', index_label='week_end')
+            fig.savefig(args.output / 'qqq_monitor.png', dpi=160)
+        if not args.no_show:
+            import matplotlib.pyplot as plt
+            plt.show()
+    except (ValueError, RuntimeError, OSError) as exc:
+        parser.exit(1, f'Error: {exc}\n')
+
+
+if __name__ == '__main__':
+    main()
